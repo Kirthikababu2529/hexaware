@@ -1,0 +1,237 @@
+import streamlit as st
+from transformers import T5Tokenizer, T5ForConditionalGeneration
+from sentence_transformers import SentenceTransformer, util
+import spacy
+import pdfplumber
+import docx
+import pandas as pd
+from io import BytesIO
+import smtplib
+from email.message import EmailMessage
+import random
+import os
+from langchain_community.llms import Ollama
+from langchain.document_loaders import UnstructuredFileLoader
+from langchain_community.vectorstores import FAISS
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.chains import RetrievalQA
+from fpdf import FPDF
+
+# Load pre-trained models
+nlp = spacy.load("en_core_web_md")
+tokenizer = T5Tokenizer.from_pretrained("t5-base")
+model = T5ForConditionalGeneration.from_pretrained("t5-base")
+similarity_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+
+# Function to extract text from uploaded files
+def extract_text_from_file(uploaded_file):
+    text = ""
+    if uploaded_file.type == "application/pdf":
+        with pdfplumber.open(uploaded_file) as pdf:
+            for page in pdf.pages:
+                text += page.extract_text()
+    elif uploaded_file.type == "text/plain":
+        text = uploaded_file.read().decode("utf-8")
+    elif uploaded_file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        doc = docx.Document(uploaded_file)
+        for para in doc.paragraphs:
+            text += para.text
+    return text
+
+# Helper functions for document generation
+def generate_pdf(content, filename):
+    pdf_buffer = BytesIO()
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    for line in content.split("\n"):
+        pdf.multi_cell(0, 10, line)
+    pdf.output(pdf_buffer)
+    pdf_buffer.seek(0)
+    return pdf_buffer
+
+def generate_excel(data, filename):
+    df = pd.DataFrame(data)
+    excel_buffer = BytesIO()
+    df.to_excel(excel_buffer, index=False)
+    excel_buffer.seek(0)
+    return excel_buffer
+
+# Function to send notifications
+def send_notification(recipient, subject, message):
+    try:
+        msg = EmailMessage()
+        msg.set_content(message)
+        msg['Subject'] = subject
+        msg['From'] = 'your_email@example.com'
+        msg['To'] = recipient
+
+        with smtplib.SMTP('smtp.example.com', 587) as server:
+            server.starttls()
+            server.login('your_email@example.com', 'your_password')
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        return False, str(e)
+
+# Function to generate MCQs with correct options
+def generate_mcq(text, num_questions=5):
+    doc = nlp(text)
+    sentences = [sent.text for sent in doc.sents]
+    questions = []
+    options_template = ["a) {}", "b) {}", "c) {}", "d) {}"]
+
+    for _ in range(num_questions):
+        if sentences:
+            context = sentences.pop(0)
+            prompt = f"Generate a multiple-choice question with four options based on this: {context}. Include the correct answer among the options."
+            input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+            output = model.generate(input_ids, max_length=150, num_beams=4, early_stopping=True)
+            generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+            
+            parts = generated_text.split("Correct Answer:")
+            if len(parts) == 2:
+                question_text = parts[0].strip()
+                correct_answer = parts[1].strip()
+                
+                options = [correct_answer] + [str(random.randint(10, 100)) for _ in range(3)]
+                random.shuffle(options)
+                formatted_options = [opt.format(option) for opt, option in zip(options_template, options)]
+
+                question = f"{question_text}\n" + "\n".join(formatted_options)
+                questions.append({"Question": question, "Answer": correct_answer})
+            else:
+                questions.append({"Question": generated_text.strip(), "Answer": "No correct answer provided"})
+        else:
+            break
+
+    return questions
+
+# Function to match and generate relevant questions
+def match_and_generate_questions(curriculum_text, num_questions=5):
+    curriculum_sentences = [sent.text for sent in nlp(curriculum_text).sents]
+    curriculum_embeddings = similarity_model.encode(curriculum_sentences)
+    
+    if len(curriculum_sentences) == 0:
+        return []
+
+    questions = []
+    for _ in range(num_questions):
+        if len(curriculum_sentences) > 0:
+            similarities = util.pytorch_cos_sim(curriculum_embeddings, curriculum_embeddings).mean(dim=1)
+            most_relevant_sentence_idx = similarities.argmax().item()
+            
+            most_relevant_sentence = curriculum_sentences.pop(most_relevant_sentence_idx)
+            curriculum_embeddings = similarity_model.encode(curriculum_sentences)
+            
+            generated_mcqs = generate_mcq(most_relevant_sentence, num_questions=1)
+            questions.extend(generated_mcqs)
+        else:
+            break
+
+    return questions
+
+# LangChain-based question generation function
+def generate_langchain_questions(document_path, question, num_questions=5):
+    # Load the document
+    loader = UnstructuredFileLoader(document_path)
+    documents = loader.load()
+
+    # Split the document into chunks
+    text_splitter = CharacterTextSplitter(separator="\n", chunk_size=1000, chunk_overlap=200)
+    text_chunks = text_splitter.split_documents(documents)
+
+    # Load the vector embedding model
+    embeddings = HuggingFaceEmbeddings()
+    knowledge_base = FAISS.from_documents(text_chunks, embeddings)
+
+    # Create the Retrieval QA chain
+    llm = Ollama(model="llama3.1", temperature=0)
+    qa_chain = RetrievalQA.from_chain_type(llm, retriever=knowledge_base.as_retriever())
+
+    # Generate the questions and answers
+    response = qa_chain.invoke({"query": question})
+    result_text = response["result"]
+
+    return result_text
+
+# Streamlit app layout
+st.title("Automated Question Builder Application")
+
+# Role selection
+st.header("Select Your Role")
+roles = ["Administrator", "Trainer", "Employee"]
+role = st.radio("Role", roles)
+
+# Admin functionalities
+if role == "Administrator":
+    st.header("Admin Dashboard")
+    st.text("User Management, System Monitoring, and Report Generation functionalities will be implemented here.")
+    # Placeholder for admin functionalities
+
+# Trainer functionalities
+if role == "Trainer":
+    st.header("Upload Curriculum")
+    curriculum = st.file_uploader("Upload a curriculum file (PDF, TXT, DOCX)", type=['pdf', 'txt', 'docx'])
+
+    if curriculum is not None:
+        st.success("Curriculum uploaded successfully!")
+        curriculum_text = extract_text_from_file(curriculum)
+
+        # Choose question type
+        st.header("Generate Questions")
+        question_type = st.selectbox("Select question type", ["MCQ", "Coding", "LangChain Generated"])
+        num_questions = st.slider("Select the number of questions", 1, 20, 5)
+
+        if st.button("Generate Questions"):
+            if question_type == "MCQ":
+                generated_questions = match_and_generate_questions(curriculum_text, num_questions)
+            elif question_type == "Coding":
+                generated_questions = generate_coding_question(curriculum_text, num_questions)
+            elif question_type == "LangChain Generated":
+                question = "Generate questions based on the content"
+                document_path = "/path/to/uploaded/document"  # Path to the uploaded document
+                generated_questions = generate_langchain_questions(document_path, question, num_questions)
+                st.write(generated_questions)
+            else:
+                st.error("Selected option is not yet implemented")
+
+            st.subheader("Generated Questions")
+            questions_list = []
+            for i, question in enumerate(generated_questions):
+                st.write(f"**Question {i+1}:** {question['Question']}")
+                questions_list.append({"Question": f"Question {i+1}", "Content": question['Question'], "Answer": question['Answer']})
+
+            if st.button("Download as PDF"):
+                pdf_buffer = generate_pdf("\n".join([f"{q['Question']}\nCorrect Answer: {q['Answer']}" for q in questions_list]), "questions.pdf")
+                st.download_button("Download PDF", pdf_buffer, file_name="questions.pdf")
+
+            if st.button("Download as Excel"):
+                excel_buffer = generate_excel(questions_list, "questions.xlsx")
+                st.download_button("Download Excel", excel_buffer, file_name="questions.xlsx")
+
+            if send_notification('trainer@example.com', 'New Question Bank Generated', 'A new question bank has been generated and is available for download.'):
+                st.success("Notification sent to trainer.")
+            else:
+                st.error("Failed to send notification.")
+
+# Employee functionalities
+if role == "Employee":
+    st.header("Self-Assessment and Learning Plan")
+    
+    if st.button("Take Self-Assessment"):
+        st.info("No questions available yet. Please request a question bank from a trainer.")
+    
+    st.header("Request Personalized Learning Plan")
+    learning_goal = st.text_area("Enter your learning goals and areas of improvement:")
+    if st.button("Request Learning Plan"):
+        st.success("Your personalized learning plan has been generated!")
+
+    st.header("Feedback")
+    feedback = st.text_area("Provide feedback on the questions or assessments you have completed.")
+    if st.button("Submit Feedback"):
+        st.success("Thank you for your feedback!")
+
+st.write("---")
+st.write("© 2024 Automated Question Builder Application - Powered by Streamlit and Hugging Face")
